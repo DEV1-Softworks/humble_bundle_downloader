@@ -21,16 +21,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Guard / two-factor handling and post-login verification.
 - Network timeouts on every HTTP request (auth, library, order detail,
   and file downloads); timeouts surface as a clear `HumbleRequestError`.
-- Atomic downloads via a `.part` file with size verification before the
+- Atomic downloads via a `.part` file with MD5 verification before the
   file is moved into place.
+- MD5 hash verification using Humble's per-file `md5` as the
+  authoritative integrity check, for both the already-downloaded skip
+  decision and post-download validation; a hash mismatch fails and
+  retries so corrupt files are re-fetched rather than trusted.
 - Per-file retries with exponential backoff; failing orders/files are
   logged and skipped instead of aborting the whole run.
 - Configurable politeness delay between requests
   (`HUMBLE_REQUEST_DELAY`, default `1.0s`).
+- Failure report: downloads that cannot be completed (corruption or
+  network) are appended to a log file with the product, target path,
+  expected MD5, reason, and signed URL so they can be downloaded
+  manually. Configurable via `HUMBLE_FAILURE_REPORT`; defaults to
+  `<download dir>/failed_downloads.log`.
 - Progress and error logging via the standard `logging` module.
 - Test coverage for authentication, timeout handling, filename
-  derivation, path-traversal sanitisation, size verification, and
-  error-resilient orchestration.
+  derivation, path-traversal sanitisation, MD5 verification (skip,
+  redownload, and post-download mismatch), format-label extension
+  resolution, failure-report recording, and error-resilient
+  orchestration.
 
 ### Changed
 
@@ -43,6 +54,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   string.
 - Path components are sanitised against directory traversal (`.`, `..`,
   leading dots) and control/reserved characters.
+- `file_size` is now advisory only: when no MD5 is available, a
+  size discrepancy is logged at debug level and the downloaded file is
+  kept instead of being deleted and retried.
+
+### Fixed
+
+- Downloaded files now always receive a correct extension. Humble's
+  `download_struct[].name` is a format label (`PDF`, `EPUB`, ...), not a
+  filename, so the extension is resolved from an explicit named file, the
+  signed URL path, or the format label, in that order.
+- Files with a stale Humble `file_size` are no longer endlessly
+  re-downloaded and discarded; integrity is judged by MD5 when present.
 
 ### Security
 

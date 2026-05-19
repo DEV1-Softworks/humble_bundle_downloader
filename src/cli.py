@@ -14,7 +14,11 @@ from typing import Optional
 from dotenv import load_dotenv
 
 from .client import HumbleClient, HumbleAuthenticationError, TwoFactorRequiredError
-from .downloader import DEFAULT_REQUEST_DELAY, download_all_orders
+from .downloader import (
+    DEFAULT_FAILURE_REPORT_NAME,
+    DEFAULT_REQUEST_DELAY,
+    download_all_orders,
+)
 
 
 @dataclass
@@ -25,6 +29,7 @@ class Config:
     session_file: Path
     output_dir: Path
     request_delay: float
+    failure_report: Path
 
 
 def load_config() -> Config:
@@ -42,13 +47,21 @@ def load_config() -> Config:
         )
     except ValueError:
         delay = DEFAULT_REQUEST_DELAY
+    output_dir = Path(os.getenv("HUMBLE_DOWNLOAD_DIR", "downloads"))
+    failure_report = Path(
+        os.getenv(
+            "HUMBLE_FAILURE_REPORT",
+            str(output_dir / DEFAULT_FAILURE_REPORT_NAME),
+        )
+    )
     return Config(
         session_cookie=os.getenv("HUMBLE_SESSION_COOKIE") or None,
         session_file=Path(
             os.getenv("HUMBLE_SESSION_FILE", ".humble_session.json")
         ),
-        output_dir=Path(os.getenv("HUMBLE_DOWNLOAD_DIR", "downloads")),
+        output_dir=output_dir,
         request_delay=max(0.0, delay),
+        failure_report=failure_report,
     )
 
 
@@ -106,7 +119,10 @@ def main() -> None:
     client.save_session()
 
     download_all_orders(
-        client, config.output_dir, request_delay=config.request_delay
+        client,
+        config.output_dir,
+        request_delay=config.request_delay,
+        failure_report=config.failure_report,
     )
 
 

@@ -11,11 +11,13 @@ This module focuses on:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
@@ -39,6 +41,11 @@ DEFAULT_REQUEST_DELAY = 1.0
 # How many times to retry a single file before giving up on it.
 DEFAULT_MAX_RETRIES = 3
 
+# Default filename for the report of downloads that could not be
+# completed (corruption / network), written inside the output dir so the
+# user can fetch the listed files manually.
+DEFAULT_FAILURE_REPORT_NAME = "failed_downloads.log"
+
 
 @dataclass
 class DownloadFile:
@@ -49,6 +56,7 @@ class DownloadFile:
     subproduct_name: str
     platform: str
     expected_size: Optional[int] = None
+    expected_md5: Optional[str] = None
 
 
 def _sanitize_path_component(name: str) -> str:
@@ -165,12 +173,18 @@ def iter_downloadable_files(order_json: Dict[str, Any]) -> Iterable[DownloadFile
                 except (TypeError, ValueError):
                     expected_size = None
 
+                # Humble's `md5` is the authoritative integrity check;
+                # `file_size` is frequently stale and only advisory.
+                md5 = struct.get("md5")
+                expected_md5 = md5.strip().lower() if isinstance(md5, str) and md5.strip() else None
+
                 yield DownloadFile(
                     url=web_url,
                     filename=_sanitize_path_component(file_name),
                     subproduct_name=sub_name,
                     platform=platform,
                     expected_size=expected_size,
+                    expected_md5=expected_md5,
                 )
 
 
@@ -207,17 +221,35 @@ def build_target_path(
     return folder / file.filename
 
 
-def _is_already_complete(target_path: Path, expected_size: Optional[int]) -> bool:
+def _file_md5(path: Path) -> str:
+    """Return the hex MD5 digest of ``path``, read in 1 MiB chunks."""
+    digest = hashlib.md5()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _is_already_complete(target_path: Path, file: DownloadFile) -> bool:
     """
-    Return ``True`` only if the file exists *and* matches the expected
-    size. A size mismatch means a previous run was interrupted, so the
-    file must be downloaded again instead of being trusted.
+    Return ``True`` when an on-disk copy can be trusted as complete.
+
+    Verification order, strongest first:
+
+    1. If Humble supplied an MD5, the existing file's hash must match it.
+       This is the authoritative source of truth and reliably detects
+       both truncated and corrupted files.
+    2. Else fall back to the (advisory) ``file_size`` when present, which
+       still catches stale partial files from an interrupted run.
+    3. Else accept any existing non-empty file.
     """
-    if not target_path.exists():
+    if not target_path.exists() or target_path.stat().st_size == 0:
         return False
-    if expected_size is None:
-        return True
-    return target_path.stat().st_size == expected_size
+    if file.expected_md5 is not None:
+        return _file_md5(target_path) == file.expected_md5
+    if file.expected_size is not None:
+        return target_path.stat().st_size == file.expected_size
+    return True
 
 
 def download_file(
@@ -227,14 +259,14 @@ def download_file(
     Download ``file`` to ``target_path`` atomically.
 
     The data is streamed to a ``.part`` sibling file and only renamed
-    into place once the full body (and, when known, the expected size)
-    has been received, so an interrupted run never leaves a truncated
-    file that looks complete.
+    into place once the full body has been received and, when Humble
+    supplied one, its MD5 hash verifies, so an interrupted or corrupted
+    run never leaves a bad file that looks complete.
 
     Returns ``True`` if a download happened, ``False`` if it was skipped
     because a valid copy already exists.
     """
-    if _is_already_complete(target_path, file.expected_size):
+    if _is_already_complete(target_path, file):
         logger.info("Skipping (already downloaded): %s", target_path.name)
         return False
 
@@ -250,15 +282,29 @@ def download_file(
                         continue
                     fh.write(chunk)
 
-        if (
+        # MD5 is Humble's authoritative integrity check. A mismatch
+        # means a genuinely corrupt download, so fail (and retry).
+        if file.expected_md5 is not None:
+            actual_md5 = _file_md5(part_path)
+            if actual_md5 != file.expected_md5:
+                part_path.unlink(missing_ok=True)
+                raise HumbleRequestError(
+                    f"MD5 mismatch for {target_path.name}: "
+                    f"expected {file.expected_md5}, got {actual_md5}."
+                )
+        elif (
             file.expected_size is not None
             and part_path.stat().st_size != file.expected_size
         ):
-            actual = part_path.stat().st_size
-            part_path.unlink(missing_ok=True)
-            raise HumbleRequestError(
-                f"Size mismatch for {target_path.name}: "
-                f"expected {file.expected_size} bytes, got {actual}."
+            # `file_size` is frequently stale on Humble's side; without
+            # an MD5 to confirm corruption, keep the file and only note
+            # the discrepancy rather than discarding a likely-good copy.
+            logger.debug(
+                "Size advisory for %s: expected %d bytes, got %d "
+                "(no MD5 to verify; keeping file).",
+                target_path.name,
+                file.expected_size,
+                part_path.stat().st_size,
             )
 
         os.replace(part_path, target_path)
@@ -311,12 +357,45 @@ def _download_with_retry(
     raise last_exc
 
 
+def _record_failure(
+    report_path: Path,
+    *,
+    product: str,
+    target_path: Path,
+    url: str,
+    expected_md5: Optional[str],
+    reason: str,
+) -> None:
+    """
+    Append one failed download to ``report_path`` for manual recovery.
+
+    Each record is appended (and flushed) immediately so an interrupted
+    run still leaves a usable report. The signed Humble URL is included
+    because it is what the user needs to download the file by hand, with
+    the expected MD5 so the manual copy can be verified. Note that signed
+    URLs are time-limited and may need refreshing from the library page.
+    """
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = [
+        f"[{timestamp}] {product}",
+        f"  file : {target_path}",
+        f"  md5  : {expected_md5 or '(not provided by Humble)'}",
+        f"  why  : {reason}",
+        f"  url  : {url}",
+        "",
+    ]
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    with report_path.open("a", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
 def download_all_orders(
     client: HumbleClient,
     output_dir: Path,
     orders: Optional[List[HumbleOrder]] = None,
     request_delay: float = DEFAULT_REQUEST_DELAY,
     max_retries: int = DEFAULT_MAX_RETRIES,
+    failure_report: Optional[Path] = None,
 ) -> None:
     """
     Download all available files for the user's orders.
@@ -338,8 +417,14 @@ def download_all_orders(
         Seconds to pause between HTTP requests.
     max_retries:
         Attempts per file before it is skipped.
+    failure_report:
+        Path to the file where downloads that could not be completed are
+        recorded for manual recovery. Defaults to
+        ``<output_dir>/failed_downloads.log``.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
+    if failure_report is None:
+        failure_report = output_dir / DEFAULT_FAILURE_REPORT_NAME
     orders = orders if orders is not None else client.list_orders()
 
     total = len(orders)
@@ -369,7 +454,20 @@ def download_all_orders(
                     client, file, path, max_retries
                 )
             except HumbleRequestError as exc:
-                logger.error("Giving up on %s: %s", path.name, exc)
+                logger.error(
+                    "Giving up on %s: %s (recorded in %s)",
+                    path.name,
+                    exc,
+                    failure_report,
+                )
+                _record_failure(
+                    failure_report,
+                    product=order.product or order.gamekey,
+                    target_path=path,
+                    url=file.url,
+                    expected_md5=file.expected_md5,
+                    reason=str(exc),
+                )
                 continue
 
             if downloaded and request_delay > 0:
