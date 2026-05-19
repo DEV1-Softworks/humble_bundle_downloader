@@ -31,6 +31,10 @@ coverage.xml
 # Environment and local settings
 .env
 
+# Cached authenticated session (contains the Humble session cookie)
+.humble_session.json
+*.humble_session.json
+
 # Local downloads
 downloads/
 

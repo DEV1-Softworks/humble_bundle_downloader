@@ -1,0 +1,5 @@
+[tool.pytest.ini_options]
+# The package lives in ./src and is imported as `src`; put the repo
+# root on sys.path so `import src.*` resolves when running pytest.
+pythonpath = ["."]
+testpaths = ["tests"]
